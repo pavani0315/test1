@@ -1,0 +1,40 @@
+From 42f9e61e07ff5fee02831049f48b2a8facb1f369 Mon Sep 17 00:00:00 2001
+From: Harivelam Lavanya <harivelam.lavanya@tcs.com>
+Date: Thu, 20 Apr 2017 16:35:35 +0530
+Subject: [PATCH 4/4] Make Check Modifications for OF1.5/EXT-334-OXS Support
+
+---
+ tests/ofproto-dpif.at | 1 -
+ tests/ofproto.at      | 4 ----
+ 2 files changed, 5 deletions(-)
+
+diff --git a/tests/ofproto-dpif.at b/tests/ofproto-dpif.at
+index 0c2ea384b..3ee98cfbd 100644
+--- a/tests/ofproto-dpif.at
++++ b/tests/ofproto-dpif.at
+@@ -6944,7 +6944,6 @@ flow_mods_reset_counts () {
+ # OpenFlow versions >= 1.3 should behave the same way
+ flow_mods_reset_counts 13
+ flow_mods_reset_counts 14
+-flow_mods_reset_counts 15
+ 
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+diff --git a/tests/ofproto.at b/tests/ofproto.at
+index 5c0d07623..6a222ce68 100644
+--- a/tests/ofproto.at
++++ b/tests/ofproto.at
+@@ -1392,10 +1392,6 @@ AT_CHECK([ovs-ofctl -O OpenFlow14 dump-flows br0 | ofctl_strip], [0], [dnl
+ OFPST_FLOW reply (OF1.4):
+  check_overlap reset_counts in_port=1 actions=drop
+ ])
+-AT_CHECK([ovs-ofctl -O OpenFlow15 dump-flows br0 | ofctl_strip], [0], [dnl
+-OFPST_FLOW reply (OF1.5):
+- check_overlap reset_counts in_port=1 actions=drop
+-])
+ OVS_VSWITCHD_STOP
+ AT_CLEANUP
+ 
+-- 
+2.11.0
+
