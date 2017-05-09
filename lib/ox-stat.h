@@ -26,5 +26,8 @@
 #include "openvswitch/ofp-errors.h"
 #include "openvswitch/types.h"
 
+int oxs_put_agg_stat(struct ofpbuf *, const struct ofputil_aggregate_stats *,
+                     enum ofp_version);
+int oxs_pull_agg_stat(struct ofpbuf , struct ofputil_aggregate_stats *);
 
 #endif /* ox_stat.h */
