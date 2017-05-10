@@ -50,8 +50,11 @@
 #include "unaligned.h"
 #include "util.h"
 #include "uuid.h"
+#include "ox-stat.h"
 
 VLOG_DEFINE_THIS_MODULE(ofp_util);
+
+extern uint8_t oxs_field_set;
 
 /* Rate limit for OpenFlow message parse errors.  These always indicate a bug
  * in the peer and so there's not much point in showing a lot of them. */
@@ -2313,6 +2316,39 @@ ofputil_decode_ofpst11_flow_request(struct ofputil_flow_stats_request *fsr,
     return 0;
 }
 
+ofputil_decode_ofpst15_flow_request(struct ofputil_flow_stats_request *fsr,
+                                    struct ofpbuf *b, bool aggregate,
+                                    const struct tun_table *tun_table,
+                                    const struct vl_mff_map *vl_mff_map)
+{
+   const struct ofp15_oxs_flow_stats_request *ofsr;
+   enum ofperr error,stat_error;
+   uint16_t statlen;
+
+   ofsr = ofpbuf_pull(b, sizeof *ofsr);
+   fsr->aggregate = aggregate;
+   fsr->table_id = ofsr->table_id;
+
+   error = ofputil_port_from_ofp11(ofsr->out_port, &fsr->out_port);
+   if (error) {
+       return error;
+   }
+
+   fsr->out_group = ntohl(ofsr->out_group);
+   fsr->cookie = ofsr->cookie;
+   fsr->cookie_mask = ofsr->cookie_mask;
+
+   error = ofputil_pull_ofp11_match(b, tun_table, vl_mff_map, &fsr->match,
+                                    NULL);
+   stat_error = oxs_pull_stat(b, NULL, &statlen);
+
+   if (error || stat_error) {
+       return error;
+   }
+
+   return 0;
+}
+
 static enum ofperr
 ofputil_decode_nxst_flow_request(struct ofputil_flow_stats_request *fsr,
                                  struct ofpbuf *b, bool aggregate,
@@ -2762,6 +2798,10 @@ ofputil_decode_flow_stats_request(struct ofputil_flow_stats_request *fsr,
     case OFPRAW_OFPST11_AGGREGATE_REQUEST:
         return ofputil_decode_ofpst11_flow_request(fsr, &b, true, tun_table,
                                                    vl_mff_map);
+    case OFPRAW_OFPST15_OXS_FLOW_REQUEST:
+        oxs_field_set = 0;
+        return ofputil_decode_ofpst15_flow_request(fsr, &b, false, tun_table,
+                                                   vl_mff_map);
 
     case OFPRAW_NXST_FLOW_REQUEST:
         return ofputil_decode_nxst_flow_request(fsr, &b, false, tun_table,
@@ -2791,9 +2831,7 @@ ofputil_encode_flow_stats_request(const struct ofputil_flow_stats_request *fsr,
     case OFPUTIL_P_OF11_STD:
     case OFPUTIL_P_OF12_OXM:
     case OFPUTIL_P_OF13_OXM:
-    case OFPUTIL_P_OF14_OXM:
-    case OFPUTIL_P_OF15_OXM:
-    case OFPUTIL_P_OF16_OXM: {
+    case OFPUTIL_P_OF14_OXM: {
         struct ofp11_flow_stats_request *ofsr;
 
         raw = (fsr->aggregate
@@ -2808,6 +2846,25 @@ ofputil_encode_flow_stats_request(const struct ofputil_flow_stats_request *fsr,
         ofsr->cookie = fsr->cookie;
         ofsr->cookie_mask = fsr->cookie_mask;
         ofputil_put_ofp11_match(msg, &fsr->match, protocol);
+        break;
+    }
+
+    case OFPUTIL_P_OF15_OXM:
+    case OFPUTIL_P_OF16_OXM: {
+        struct ofp15_oxs_flow_stats_request *ofsr;
+        raw = (fsr->aggregate
+               ? OFPRAW_OFPST11_AGGREGATE_REQUEST
+               : OFPRAW_OFPST15_OXS_FLOW_REQUEST);
+        msg = ofpraw_alloc(raw, ofputil_protocol_to_ofp_version(protocol),
+                           ofputil_match_typical_len(protocol));
+        ofsr = ofpbuf_put_zeros(msg, sizeof *ofsr);
+        ofsr->table_id = fsr->table_id;
+        ofsr->out_port = ofputil_port_to_ofp11(fsr->out_port);
+        ofsr->out_group = htonl(fsr->out_group);
+        ofsr->cookie = fsr->cookie;
+        ofsr->cookie_mask = fsr->cookie_mask;
+        ofputil_put_ofp11_match(msg, &fsr->match, protocol);
+        oxs_put_stat(msg, NULL, ofputil_protocol_to_ofp_version(protocol));
         break;
     }
 
@@ -2893,7 +2950,48 @@ ofputil_decode_flow_stats_reply(struct ofputil_flow_stats *fs,
 
     if (!msg->size) {
         return EOF;
-    } else if (raw == OFPRAW_OFPST11_FLOW_REPLY
+    } else if (raw == OFPRAW_OFPST15_OXS_FLOW_REPLY) {
+        const struct ofp15_oxs_flow_stats_reply *ofs;
+        size_t length;
+        uint16_t padded_match_len;
+        uint16_t stat_len;
+
+        ofs = ofpbuf_try_pull(msg, sizeof *ofs);
+        if (!ofs) {
+          VLOG_WARN_RL(&bad_ofmsg_rl, "OFPST_FLOW reply has %"PRIu32
+                       " leftover " "bytes at end", msg->size);
+          return EINVAL;
+        }
+
+        length = ntohs(ofs->length);
+        if (length < sizeof *ofs) {
+           VLOG_WARN_RL(&bad_ofmsg_rl, "OFPST_FLOW reply claims invalid "
+                       "length %"PRIuSIZE, length);
+           return EINVAL;
+         }
+
+         if (ofputil_pull_ofp11_match(msg, NULL, NULL, &fs->match,
+                                      &padded_match_len)) {
+             VLOG_WARN_RL(&bad_ofmsg_rl, "OFPST_FLOW reply bad match");
+             return EINVAL;
+         }
+
+         fs->priority = ntohs(ofs->priority);
+         fs->table_id = ofs->table_id;
+         fs->duration_sec = 0;
+         fs->duration_nsec = 0;
+         fs->idle_age = 0;
+         fs->packet_count = 0;
+         fs->byte_count = 0;
+
+         if(oxs_pull_stat(msg, fs,&stat_len)) {
+               VLOG_WARN_RL(&bad_ofmsg_rl, "OXS OFPST_FLOW reply bad match");
+               return EINVAL;
+         }
+
+         instructions_len = length - sizeof *ofs - padded_match_len - stat_len;
+
+     } else if (raw == OFPRAW_OFPST11_FLOW_REPLY
                || raw == OFPRAW_OFPST13_FLOW_REPLY) {
         const struct ofp11_flow_stats *ofs;
         size_t length;
@@ -3067,7 +3165,22 @@ ofputil_append_flow_stats_reply(const struct ofputil_flow_stats *fs,
     orig_tun_table = fs->match.flow.tunnel.metadata.tab;
     fs_->match.flow.tunnel.metadata.tab = tun_table;
 
-    if (raw == OFPRAW_OFPST11_FLOW_REPLY || raw == OFPRAW_OFPST13_FLOW_REPLY) {
+    if (raw == OFPRAW_OFPST15_OXS_FLOW_REPLY) {
+        struct ofp15_oxs_flow_stats_reply *ofs;
+        ofpbuf_put_uninit(reply, sizeof *ofs);
+        oxm_put_match(reply, &fs->match, version);
+        oxs_put_stat(reply,fs,version);
+        ofpacts_put_openflow_instructions(fs->ofpacts, fs->ofpacts_len, reply,
+                                          version);
+
+        ofs = ofpbuf_at_assert(reply, start_ofs, sizeof *ofs);
+        ofs->length = htons(reply->size - start_ofs);
+        ofs->table_id = fs->table_id;
+        ofs->priority = htons(fs->priority);
+        ofs->reason = 0;
+        memset(ofs->pad2, 0, sizeof ofs->pad2);
+    } else if (raw == OFPRAW_OFPST11_FLOW_REPLY ||
+               raw == OFPRAW_OFPST13_FLOW_REPLY) {
         struct ofp11_flow_stats *ofs;
 
         ofpbuf_put_uninit(reply, sizeof *ofs);
@@ -3169,6 +3282,12 @@ ofputil_encode_aggregate_stats_reply(
     enum ofpraw raw;
 
     ofpraw_decode(&raw, request);
+    if(raw==OFPRAW_OFPST15_OXS_AGGREGATE_REQUEST) {
+    msg = ofpraw_alloc_stats_reply(request, 0);
+    enum ofp_version version = request->version;
+    oxs_put_agg_stat(msg,stats,version);
+    }
+    else {
     if (raw == OFPRAW_OFPST10_AGGREGATE_REQUEST) {
         packet_count = unknown_to_zero(stats->packet_count);
         byte_count = unknown_to_zero(stats->byte_count);
@@ -3182,6 +3301,7 @@ ofputil_encode_aggregate_stats_reply(
     put_32aligned_be64(&asr->packet_count, htonll(packet_count));
     put_32aligned_be64(&asr->byte_count, htonll(byte_count));
     asr->flow_count = htonl(stats->flow_count);
+    }
 
     return msg;
 }
@@ -3191,13 +3311,23 @@ ofputil_decode_aggregate_stats_reply(struct ofputil_aggregate_stats *stats,
                                      const struct ofp_header *reply)
 {
     struct ofpbuf msg = ofpbuf_const_initializer(reply, ntohs(reply->length));
-    ofpraw_pull_assert(&msg);
+    enum ofperr error;
+    enum ofpraw raw;
 
+    raw=ofpraw_pull_assert(&msg);
+    if (raw == OFPRAW_OFPST15_OXS_AGGREGATE_REPLY){
+      memset(stats, 0, sizeof(*stats));
+      error =  oxs_pull_agg_stat(msg, stats);
+      if(error)
+        return error;
+    }
+    else{
     struct ofp_aggregate_stats_reply *asr = msg.msg;
     stats->packet_count = ntohll(get_32aligned_be64(&asr->packet_count));
     stats->byte_count = ntohll(get_32aligned_be64(&asr->byte_count));
     stats->flow_count = ntohl(asr->flow_count);
 
+    }
     return 0;
 }
 
@@ -10150,6 +10280,7 @@ ofputil_is_bundlable(enum ofptype type)
     case OFPTYPE_GET_ASYNC_REQUEST:
     case OFPTYPE_DESC_STATS_REQUEST:
     case OFPTYPE_FLOW_STATS_REQUEST:
+    case OFPTYPE_OXS_FLOW_STATS_REQUEST:
     case OFPTYPE_AGGREGATE_STATS_REQUEST:
     case OFPTYPE_TABLE_STATS_REQUEST:
     case OFPTYPE_TABLE_FEATURES_STATS_REQUEST:
@@ -10178,6 +10309,7 @@ ofputil_is_bundlable(enum ofptype type)
     case OFPTYPE_QUEUE_GET_CONFIG_REPLY:
     case OFPTYPE_DESC_STATS_REPLY:
     case OFPTYPE_FLOW_STATS_REPLY:
+    case OFPTYPE_OXS_FLOW_STATS_REPLY:
     case OFPTYPE_QUEUE_STATS_REPLY:
     case OFPTYPE_PORT_STATS_REPLY:
     case OFPTYPE_TABLE_STATS_REPLY:
